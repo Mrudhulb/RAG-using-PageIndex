@@ -2,84 +2,80 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Running the Application
+## Running the App
 
 ```bash
-# Create and activate virtual environment
-python -m venv .venv
-.venv\Scripts\activate  # Windows
+# Primary entry point (FastAPI + chat UI)
+uvicorn api.main:app --reload          # http://127.0.0.1:8000
 
-# Install dependencies
-pip install -r requirements.txt
-
-# Run the Streamlit app (opens http://localhost:8501)
-streamlit run streamlit_app.py
+# Legacy Streamlit UI (still functional but secondary)
+python -m streamlit run streamlit_app.py
 ```
 
-## Environment Configuration (`.env`)
+## Environment Variables
 
-| Variable | Required | Purpose |
+Copy `.env.example` to `.env`. Required:
+
+| Variable | Required | Notes |
 |---|---|---|
-| `OPENROUTER_API_KEY` | Yes | LLM inference via OpenRouter |
-| `PAGEINDEX_API_KEY` | No | Cloud retrieval (falls back to local BM25 if absent) |
-| `OPENROUTER_MODEL` | No | Defaults to a free model (e.g., Mistral 7B) |
-| `LLM_TEMPERATURE` | No | Defaults to 0.2 |
+| `OPENROUTER_API_KEY` | Yes | Free key at openrouter.ai/keys |
+| `PAGEINDEX_API_KEY` | No | Falls back to local BM25 if absent |
+| `LLM_TEMPERATURE` | No | Default 0.2 |
+
+Default model: `openai/gpt-oss-20b:free`. Free models change frequently — query `GET https://openrouter.ai/api/v1/models` filtered by `pricing.prompt == "0"` to get the current list.
 
 ## Architecture
 
-The app is a PDF Q&A (RAG) system with **no vector embeddings**. Retrieval is tree/keyword-based.
-
-### Layer Overview
+Two entry points share the same `app/` core:
 
 ```
-streamlit_app.py         ← UI entry point, session state management
-app/
-  graph.py               ← LangGraph workflow (ingest → retrieve → generate)
-  ingestion.py           ← PDF loading; routes to PageIndex cloud or BM25
-  retrieval.py           ← Query routing; PageIndex API polling or BM25 scoring
-  llm.py                 ← OpenRouter ChatOpenAI setup and RAG prompt construction
+api/main.py          FastAPI server — mounts frontend/ as static root, loads cached docs on startup
+api/session.py       In-memory session store: chat history (List[dict]) + active IngestedDocument per session_id
+api/routes/chat.py   POST /api/chat, GET/DELETE /api/history
+api/routes/documents.py  CRUD /api/documents + select/deselect active doc per session
+
+app/graph.py         LangGraph ChatState workflow (see below)
+app/ingestion.py     PDF → IngestedDocument (PageIndex cloud or BM25)
+app/retrieval.py     Query → List[RetrievedChunk]
+app/llm.py           ChatOpenAI pointed at openrouter.ai/api/v1; tiktoken_model_name="gpt-3.5-turbo" required for non-OpenAI model names
+app/cache.py         Disk cache at .cache/<md5>.pkl; auto-loaded on startup; pageindex_client excluded from pickle
+
+frontend/            Vanilla HTML/CSS/JS + marked.js (CDN) for markdown rendering
+streamlit_app.py     Legacy UI — still wired to the same app/ core
 ```
 
-### LangGraph Workflow (`app/graph.py`)
+## LangGraph Workflow (`app/graph.py`)
 
-Three nodes operate on a shared `RAGState` TypedDict:
+State: `ChatState(TypedDict)` — `query`, `chat_history`, `active_doc`, `model`, `route`, `retrieved_chunks`, `answer`, `error`
 
-1. **`ingest_node`** — loads PDF and builds an index (`IngestedDocument`)
-2. **`retrieve_node`** — fetches top-K relevant chunks (`List[RetrievedChunk]`)
-3. **`generate_node`** — calls LLM with retrieved context to produce the answer
-
-`run_rag_pipeline()` accepts a pre-built `IngestedDocument` to skip re-ingestion on follow-up questions within the same session (cached in `st.session_state`).
-
-### Retrieval Modes (`app/ingestion.py` + `app/retrieval.py`)
-
-**PageIndex Cloud** (when `PAGEINDEX_API_KEY` is set):
-- Uploads PDF via `submit_document()`, polls `is_retrieval_ready()` (up to 5 min)
-- Queries via `submit_query()` / `get_retrieval()` polling (up to 2 min)
-- Returns tree-structured nodes flattened to page-level `RetrievedChunk` objects
-- Falls back to local BM25 if the API returns no nodes
-
-**Local BM25** (fallback, fully offline):
-- Extracts text page-by-page with `pypdf` (falls back to `pdfplumber` for scanned PDFs)
-- Builds an in-memory `BM25Okapi` index; no network calls required
-
-### Key Data Structures
-
-```python
-# IngestedDocument (app/ingestion.py)
-pdf_path: str
-mode: str          # 'pageindex' | 'bm25'
-pages: List[PageChunk]
-doc_id: Optional[str]               # set in PageIndex mode
-bm25_index: Optional[BM25Okapi]     # set in BM25 mode
-tokenized_corpus: Optional[...]     # set in BM25 mode
-
-# RetrievedChunk (app/retrieval.py)
-page_number: int   # 1-based
-text: str
-score: float
-source: str        # 'pageindex' | 'bm25' | 'bm25_fallback'
+```
+START → classifier_node ──"general"──► general_node   → END
+                        └─"document"─► retrieve_node → generate_node → END
 ```
 
-### LLM Layer (`app/llm.py`)
+- **classifier_node**: if no `active_doc` → always "general". Otherwise calls LLM with a one-word router prompt.
+- **general_node**: builds messages from `chat_history` + `query`; falls back to merged HumanMessage if SystemMessage is rejected (e.g. Gemma).
+- **retrieve_node**: calls `app/retrieval.retrieve(active_doc, query, top_k=5)`.
+- **generate_node**: if `chunks[0].source == "pageindex_answer"` the PageIndex API already answered — skip the LLM call and return directly. Otherwise builds RAG prompt with chat history context.
 
-Uses `ChatOpenAI` pointed at `https://openrouter.ai/api/v1`. The RAG prompt instructs the model to answer strictly from retrieved context and cite page numbers. Free-tier models include Mistral 7B, Llama 3 8B, Gemma 3, Qwen 3, and others selectable in the UI sidebar.
+Public entry point: `run_chat_pipeline(query, chat_history, active_doc, model) -> dict`.
+
+## Retrieval Layer (`app/ingestion.py` + `app/retrieval.py`)
+
+**PageIndex mode** (`PAGEINDEX_API_KEY` set):
+- Ingestion: `submit_document()` → poll `get_tree()` until `status == "completed"` (max 90s). **Do not** use `is_retrieval_ready()` — it returns `False` on free-tier keys.
+- Retrieval: `chat_completions(messages, doc_id=doc_id)` — PageIndex handles retrieval + generation internally. A synthetic `RetrievedChunk(source="pageindex_answer")` is inserted at index 0 to carry the answer through.
+- BM25 over tree nodes is used only for source page display, not for the answer.
+
+**BM25 mode** (no API key):
+- `pypdf` extracts text page-by-page; falls back to `pdfplumber` if >50% pages are empty.
+- `BM25Okapi` index built in memory; stored in `IngestedDocument.bm25_index`.
+
+**`IngestedDocument`** key fields: `pdf_path`, `mode`, `pages: List[PageChunk]`, `doc_id` (PageIndex), `pageindex_client` (excluded from pickle), `bm25_index`, `tokenized_corpus`.
+
+## Document Cache (`app/cache.py`)
+
+- Cache key = MD5 of the PDF file bytes → `.cache/<hash>.pkl`
+- `pageindex_client` is set to `None` before pickling and recreated from env on `load()`.
+- `get_doc_handle(file_path)` returns the MD5 string used as `doc_handle` in all API responses.
+- On FastAPI startup, all `.cache/*.pkl` files are loaded and registered into the session store so previously indexed PDFs are immediately available.
