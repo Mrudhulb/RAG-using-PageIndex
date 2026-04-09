@@ -21,6 +21,10 @@ Copy `.env.example` to `.env`. Required:
 | `OPENROUTER_API_KEY` | Yes | Free key at openrouter.ai/keys |
 | `PAGEINDEX_API_KEY` | No | Falls back to local BM25 if absent |
 | `LLM_TEMPERATURE` | No | Default 0.2 |
+| `LANGCHAIN_TRACING_V2` | No | Set `true` to enable LangSmith tracing |
+| `LANGCHAIN_API_KEY` | No | LangSmith API key (ls__...) |
+| `LANGCHAIN_PROJECT` | No | Default `pageindex-rag` |
+| `TAVILY_API_KEY` | No | Enables web search tool in agent mode |
 
 Default model: `openai/gpt-oss-20b:free`. Free models change frequently — query `GET https://openrouter.ai/api/v1/models` filtered by `pricing.prompt == "0"` to get the current list.
 
@@ -46,19 +50,42 @@ streamlit_app.py     Legacy UI — still wired to the same app/ core
 
 ## LangGraph Workflow (`app/graph.py`)
 
-State: `ChatState(TypedDict)` — `query`, `chat_history`, `active_doc`, `model`, `route`, `retrieved_chunks`, `answer`, `error`
+State: `ChatState(TypedDict)` — `query`, `chat_history`, `active_doc`, `model`, `route`, `retrieved_chunks`, `answer`, `error`, `messages` (Annotated with `operator.add`), `iterations`
 
 ```
-START → classifier_node ──"general"──► general_node   → END
-                        └─"document"─► retrieve_node → generate_node → END
+START → classifier_node ──"general"──► general_node                          → END
+                        ├─"document"─► retrieve_node → generate_node         → END
+                        └─"agent"───► agent_node ↔ tool_node (ReAct, max 5)
+                                                └─► agent_final_node         → END
 ```
 
-- **classifier_node**: if no `active_doc` → always "general". Otherwise calls LLM with a one-word router prompt.
+- **classifier_node**: routes to "general", "document", or "agent". No `active_doc` + web query → "agent". `active_doc` set + doc question → "document". Default fallback when `active_doc` present → "document".
 - **general_node**: builds messages from `chat_history` + `query`; falls back to merged HumanMessage if SystemMessage is rejected (e.g. Gemma).
 - **retrieve_node**: calls `app/retrieval.retrieve(active_doc, query, top_k=5)`.
 - **generate_node**: if `chunks[0].source == "pageindex_answer"` the PageIndex API already answered — skip the LLM call and return directly. Otherwise builds RAG prompt with chat history context.
+- **agent_node**: LLM with bound tools; on first call builds messages from `chat_history` + `query`; on re-entry messages already include tool results.
+- **tool_node**: `langgraph.prebuilt.ToolNode` — executes any tool calls emitted by `agent_node`.
+- **agent_final_node**: walks `messages` in reverse to find the last AIMessage with no pending `tool_calls`; returns it as `answer`.
 
 Public entry point: `run_chat_pipeline(query, chat_history, active_doc, model) -> dict`.
+
+## Agent Tools (`app/tools.py`)
+
+When `classifier_node` routes to "agent", a ReAct loop runs (max 5 iterations):
+
+```
+agent_node → tool_node → agent_node → ... → agent_final_node → END
+```
+
+Available tools (loaded based on env vars):
+- `tavily_search` — requires `TAVILY_API_KEY`
+- `browser_navigate`, `browser_get_text`, `browser_screenshot` — requires `playwright install chromium`
+
+## LangSmith Tracing
+
+Set `LANGCHAIN_TRACING_V2=true` and `LANGCHAIN_API_KEY` in `.env`.
+LangChain/LangGraph instruments automatically — no code changes needed.
+Project: `pageindex-rag` (set via `LANGCHAIN_PROJECT`).
 
 ## Retrieval Layer (`app/ingestion.py` + `app/retrieval.py`)
 
