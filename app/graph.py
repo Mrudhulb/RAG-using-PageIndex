@@ -454,6 +454,14 @@ def get_graph():
 # High-level convenience function
 # ---------------------------------------------------------------------------
 
+try:
+    from langsmith import traceable as _traceable
+    _trace_decorator = _traceable(run_type="chain", name="chat_pipeline")
+except Exception:
+    _trace_decorator = lambda f: f  # no-op if langsmith not available
+
+
+@_trace_decorator
 def run_chat_pipeline(
     query: str,
     chat_history: List[dict],
