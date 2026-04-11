@@ -9,16 +9,21 @@ Run with:
 
 from __future__ import annotations
 
+# load_dotenv MUST come first — before any langchain/langsmith import so that
+# LANGCHAIN_TRACING_V2, LANGCHAIN_API_KEY, etc. are visible when LangChain
+# initialises its global callback manager.
+from dotenv import load_dotenv
+load_dotenv()
+
 import logging
 import os
+import pickle
+from contextlib import asynccontextmanager
 from pathlib import Path
 
-from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-
-load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,42 +31,30 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Application factory
-# ---------------------------------------------------------------------------
-
-app = FastAPI(
-    title="PageIndex RAG Chat",
-    description="FastAPI + LangGraph chatbot with PDF RAG capabilities.",
-    version="1.0.0",
-)
-
-# CORS — allow all origins for local development
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # ---------------------------------------------------------------------------
-# API routes (mounted under /api)
+# Lifespan: load cached documents + log LangSmith tracing status
 # ---------------------------------------------------------------------------
 
-from api.routes.chat import router as chat_router
-from api.routes.documents import router as documents_router
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan: runs startup logic before yield, shutdown after."""
 
-app.include_router(chat_router, prefix="/api")
-app.include_router(documents_router, prefix="/api")
+    # ── LangSmith tracing status ─────────────────────────────────────────
+    tracing_on = os.getenv("LANGCHAIN_TRACING_V2", "").lower() in ("true", "1")
+    project     = os.getenv("LANGCHAIN_PROJECT", "default")
+    logger.info(
+        "LangSmith tracing: %s (project=%s)",
+        "ENABLED" if tracing_on else "DISABLED",
+        project,
+    )
+    if tracing_on and not os.getenv("LANGCHAIN_API_KEY", "").strip():
+        logger.warning(
+            "LANGCHAIN_TRACING_V2=true but LANGCHAIN_API_KEY is not set — "
+            "traces will NOT be sent."
+        )
 
-# ---------------------------------------------------------------------------
-# Startup: load cached documents
-# ---------------------------------------------------------------------------
-
-@app.on_event("startup")
-async def startup_event():
-    """Load all previously cached documents into the session store."""
+    # ── Load cached documents ─────────────────────────────────────────────
     logger.info("Loading cached documents on startup …")
 
     from app.cache import list_cached, load as cache_load, get_doc_handle, CACHE_DIR
@@ -75,20 +68,15 @@ async def startup_event():
         if not pkl_path:
             continue
 
-        # Try to find the original pdf_path from the pickled doc
         try:
-            import pickle
             with open(pkl_path, "rb") as f:
                 doc = pickle.load(f)
 
             pdf_path = getattr(doc, "pdf_path", "")
             if not pdf_path or not os.path.isfile(pdf_path):
-                # pdf_path is stored in doc; reload via cache_load using pkl stem as handle
-                # We can register with the handle derived from the pkl filename
-                doc_handle = Path(pkl_path).stem  # the md5 hash IS the stem
+                doc_handle = Path(pkl_path).stem
                 filename = Path(pdf_path).name if pdf_path else doc_handle
 
-                # Recreate live client for pageindex mode
                 if doc.mode == "pageindex" and doc.doc_id:
                     api_key = os.getenv("PAGEINDEX_API_KEY", "").strip()
                     if api_key:
@@ -124,6 +112,38 @@ async def startup_event():
 
     logger.info("Startup complete — %d cached document(s) loaded.", loaded)
 
+    yield  # ── application runs ──
+
+
+# ---------------------------------------------------------------------------
+# Application factory
+# ---------------------------------------------------------------------------
+
+app = FastAPI(
+    title="PageIndex RAG Chat",
+    description="FastAPI + LangGraph chatbot with PDF RAG capabilities.",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+# CORS — allow all origins for local development
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------------------------------------------------------------------------
+# API routes (mounted under /api)
+# ---------------------------------------------------------------------------
+
+from api.routes.chat import router as chat_router
+from api.routes.documents import router as documents_router
+
+app.include_router(chat_router, prefix="/api")
+app.include_router(documents_router, prefix="/api")
 
 # ---------------------------------------------------------------------------
 # Static files (frontend) — mounted last so API routes take priority

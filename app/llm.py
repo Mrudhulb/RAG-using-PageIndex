@@ -26,12 +26,9 @@ import os
 import logging
 from typing import List
 
-from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.language_models.chat_models import BaseChatModel
-
-load_dotenv()
 
 logger = logging.getLogger(__name__)
 

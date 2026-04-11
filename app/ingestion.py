@@ -24,10 +24,6 @@ import logging
 from dataclasses import dataclass, field
 from typing import List, Optional, Any, Dict
 
-from dotenv import load_dotenv
-
-load_dotenv()
-
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------

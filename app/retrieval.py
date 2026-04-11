@@ -17,10 +17,6 @@ import logging
 from dataclasses import dataclass
 from typing import List
 
-from dotenv import load_dotenv
-
-load_dotenv()
-
 logger = logging.getLogger(__name__)
 
 

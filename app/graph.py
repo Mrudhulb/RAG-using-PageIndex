@@ -18,14 +18,12 @@ from __future__ import annotations
 
 import logging
 import operator
+import os
 from typing import Annotated, Any, Dict, List, Optional
 
-from dotenv import load_dotenv
 from typing_extensions import TypedDict
 
 from langgraph.graph import StateGraph, START, END
-
-load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -451,17 +449,30 @@ def get_graph():
 
 
 # ---------------------------------------------------------------------------
+# LangSmith tracing helper
+# ---------------------------------------------------------------------------
+
+def _is_langsmith_configured() -> bool:
+    """
+    Return True when both tracing is enabled AND an API key is present.
+
+    Supports both the legacy LANGCHAIN_* env var names (langsmith <0.3) and
+    the current LANGSMITH_* names (langsmith >=0.3 / 0.4.x).
+    """
+    tracing = (
+        os.getenv("LANGCHAIN_TRACING_V2", "").lower() in ("true", "1")
+        or os.getenv("LANGSMITH_TRACING", "").lower() in ("true", "1")
+    )
+    api_key = (
+        os.getenv("LANGCHAIN_API_KEY") or os.getenv("LANGSMITH_API_KEY", "")
+    ).strip()
+    return tracing and bool(api_key)
+
+
+# ---------------------------------------------------------------------------
 # High-level convenience function
 # ---------------------------------------------------------------------------
 
-try:
-    from langsmith import traceable as _traceable
-    _trace_decorator = _traceable(run_type="chain", name="chat_pipeline")
-except Exception:
-    _trace_decorator = lambda f: f  # no-op if langsmith not available
-
-
-@_trace_decorator
 def run_chat_pipeline(
     query: str,
     chat_history: List[dict],
@@ -496,7 +507,52 @@ def run_chat_pipeline(
     }
 
     graph = get_graph()
-    final_state = graph.invoke(initial_state)
+
+    if _is_langsmith_configured():
+        import langsmith as ls
+
+        project = (
+            os.getenv("LANGCHAIN_PROJECT")
+            or os.getenv("LANGSMITH_PROJECT", "pageindex-rag")
+        )
+        api_key = (
+            os.getenv("LANGCHAIN_API_KEY") or os.getenv("LANGSMITH_API_KEY", "")
+        ).strip()
+        endpoint = (
+            os.getenv("LANGCHAIN_ENDPOINT")
+            or os.getenv("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com")
+        )
+
+        final_state = None
+        try:
+            # One client per request so we can flush its specific queue.
+            client = ls.Client(api_key=api_key, api_url=endpoint)
+
+            # tracing_context() is the canonical API (langsmith >=0.1).
+            # Passing the client explicitly ensures traces go to the right
+            # project and allows us to call client.flush() afterwards.
+            with ls.tracing_context(
+                enabled=True,
+                project_name=project,
+                client=client,
+            ):
+                final_state = graph.invoke(initial_state)
+
+            # Flush the submission queue so traces arrive in the LangSmith
+            # dashboard before the FastAPI response is returned.
+            client.flush()
+            logger.debug("LangSmith traces flushed (project=%s).", project)
+        except Exception as exc:
+            logger.warning(
+                "LangSmith tracing failed (%s) — running without tracing.", exc
+            )
+            # Re-invoke only if graph.invoke() itself failed (final_state is
+            # still None). If the failure was only in flush(), the state from
+            # the traced run is already valid and we must not run again.
+            if final_state is None:
+                final_state = graph.invoke(initial_state)
+    else:
+        final_state = graph.invoke(initial_state)
 
     return {
         "answer": final_state.get("answer", ""),

@@ -13,7 +13,7 @@ A production-ready **Retrieval-Augmented Generation (RAG)** chatbot that answers
 - **Persistent document memory** — previously indexed PDFs reload automatically on server restart
 - **Chat history** — full conversation context passed to the LLM on every turn
 - **Free LLM inference** — powered by OpenRouter free-tier models
-- **LangSmith tracing** — full observability of every graph run out of the box
+- **LangSmith tracing** — full observability with per-node spans for every graph run (classifier, retrieval, generation, agent loop)
 - **FastAPI backend** — clean REST API with auto-reload dev server
 - **Chat UI** — bubble-style interface with markdown rendering, source page viewer, and document manager
 
@@ -96,9 +96,12 @@ PAGEINDEX_API_KEY=...
 TAVILY_API_KEY=tvly-...
 
 # Optional — enables LangSmith tracing at smith.langchain.com
+# Every graph node (classifier, retrieval, generation, agent loop) appears
+# as a child span so you can debug latency and token usage per step.
 LANGCHAIN_TRACING_V2=true
 LANGCHAIN_API_KEY=lsv2_pt_...
 LANGCHAIN_PROJECT=pageindex-rag
+LANGCHAIN_ENDPOINT=https://api.smith.langchain.com
 
 # LLM temperature (default: 0.2)
 LLM_TEMPERATURE=0.2
@@ -142,7 +145,7 @@ Open **http://127.0.0.1:8000** in your browser.
 │       ├── chat.py          # POST /api/chat, GET/DELETE /api/history
 │       └── documents.py     # CRUD /api/documents
 ├── app/
-│   ├── graph.py             # LangGraph workflow (3-way routing + ReAct agent loop)
+│   ├── graph.py             # LangGraph workflow (3-way routing, ReAct agent loop, LangSmith tracing)
 │   ├── tools.py             # Agent tools: Tavily search + Playwright browser
 │   ├── ingestion.py         # PDF ingestion (PageIndex or BM25)
 │   ├── retrieval.py         # Retrieval logic
