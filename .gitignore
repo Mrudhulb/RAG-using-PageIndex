@@ -33,6 +33,10 @@ ENV/
 .DS_Store
 Thumbs.db
 
+# SQLite checkpoint database (LangGraph session state)
+data/
+data/sessions.db
+
 # RuFlo / claude-flow runtime
 .swarm/
 .hive-mind/

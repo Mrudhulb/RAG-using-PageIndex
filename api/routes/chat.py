@@ -57,6 +57,7 @@ async def chat(req: ChatRequest):
             chat_history=history,
             active_doc=active_doc,
             model=req.model,
+            session_id=session_id,
         )
     except Exception as exc:
         logger.exception("Chat pipeline error: %s", exc)

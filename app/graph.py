@@ -19,6 +19,8 @@ from __future__ import annotations
 import logging
 import operator
 import os
+import sqlite3
+from pathlib import Path
 from typing import Annotated, Any, Dict, List, Optional
 
 from typing_extensions import TypedDict
@@ -389,7 +391,7 @@ def _route_after_agent(state: ChatState) -> str:
 # Graph builder
 # ---------------------------------------------------------------------------
 
-def build_graph() -> StateGraph:
+def build_graph(checkpointer=None) -> StateGraph:
     """Construct and compile the LangGraph chat+RAG+agent workflow."""
     builder = StateGraph(ChatState)
 
@@ -428,23 +430,59 @@ def build_graph() -> StateGraph:
     builder.add_edge("tool_node", "agent_node")   # ReAct loop
     builder.add_edge("agent_final_node", END)
 
-    graph = builder.compile()
-    logger.info("LangGraph chat graph compiled successfully.")
+    graph = builder.compile(checkpointer=checkpointer)
+    logger.info(
+        "LangGraph chat graph compiled (checkpointer=%s).",
+        type(checkpointer).__name__ if checkpointer else "none",
+    )
     return graph
 
 
 # ---------------------------------------------------------------------------
-# Cached singleton graph
+# SQLite checkpointer — persists graph node checkpoints across restarts
 # ---------------------------------------------------------------------------
 
+_DATA_DIR = Path("./data")
 _graph_instance = None
+_checkpointer = None
+
+
+def _get_checkpointer():
+    """
+    Return the module-level SqliteSaver instance, creating it on first call.
+
+    Uses check_same_thread=False so the connection is safe across FastAPI's
+    thread pool.  Falls back to None (no checkpointing) when the package is
+    not installed, so the app still runs without it.
+    """
+    global _checkpointer
+    if _checkpointer is None:
+        try:
+            from langgraph.checkpoint.sqlite import SqliteSaver  # type: ignore
+
+            _DATA_DIR.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(
+                str(_DATA_DIR / "sessions.db"),
+                check_same_thread=False,
+            )
+            _checkpointer = SqliteSaver(conn)
+            logger.info(
+                "SQLite checkpointer initialised at %s",
+                _DATA_DIR / "sessions.db",
+            )
+        except ImportError:
+            logger.warning(
+                "langgraph-checkpoint-sqlite not installed — "
+                "running without graph-state persistence."
+            )
+    return _checkpointer
 
 
 def get_graph():
-    """Return the compiled graph, building it once per process."""
+    """Return the compiled graph (with checkpointer), building it once per process."""
     global _graph_instance
     if _graph_instance is None:
-        _graph_instance = build_graph()
+        _graph_instance = build_graph(checkpointer=_get_checkpointer())
     return _graph_instance
 
 
@@ -478,6 +516,7 @@ def run_chat_pipeline(
     chat_history: List[dict],
     active_doc=None,
     model: str = "",
+    session_id: str = "",
 ) -> Dict[str, Any]:
     """
     Run the full chat pipeline and return the result.
@@ -488,6 +527,8 @@ def run_chat_pipeline(
     chat_history: List of {"role": ..., "content": ...} dicts.
     active_doc:   IngestedDocument or None (for general chat).
     model:        OpenRouter model name.
+    session_id:   Session UUID — used as the LangGraph thread_id so the
+                  SQLite checkpointer scopes state per user session.
 
     Returns
     -------
@@ -505,6 +546,12 @@ def run_chat_pipeline(
         "messages": [],
         "iterations": 0,
     }
+
+    # thread_id scopes the SQLite checkpoint to this session.
+    # Without a checkpointer the config is ignored gracefully.
+    invoke_config: Dict[str, Any] = {}
+    if session_id:
+        invoke_config = {"configurable": {"thread_id": session_id}}
 
     graph = get_graph()
 
@@ -536,7 +583,7 @@ def run_chat_pipeline(
                 project_name=project,
                 client=client,
             ):
-                final_state = graph.invoke(initial_state)
+                final_state = graph.invoke(initial_state, config=invoke_config)
 
             # Flush the submission queue so traces arrive in the LangSmith
             # dashboard before the FastAPI response is returned.
@@ -550,9 +597,9 @@ def run_chat_pipeline(
             # still None). If the failure was only in flush(), the state from
             # the traced run is already valid and we must not run again.
             if final_state is None:
-                final_state = graph.invoke(initial_state)
+                final_state = graph.invoke(initial_state, config=invoke_config)
     else:
-        final_state = graph.invoke(initial_state)
+        final_state = graph.invoke(initial_state, config=invoke_config)
 
     return {
         "answer": final_state.get("answer", ""),

@@ -1,0 +1,48 @@
+# =============================================================================
+# .dockerignore — files excluded from the Docker build context
+# =============================================================================
+
+# ── Secrets — NEVER bake into the image ────────────────────────────────────
+.env
+.env.local
+.env.*.local
+# Allow the example file (contains no real secrets)
+!.env.example
+
+# ── Python cache / compiled bytecode ────────────────────────────────────────
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Runtime data (mounted as volumes — not part of the image) ───────────────
+.cache/
+tmp/
+
+# ── Version control ──────────────────────────────────────────────────────────
+.git/
+.gitignore
+.gitattributes
+
+# ── Editor / OS artefacts ────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── Documentation (reduces context size — not needed at runtime) ─────────────
+*.md
+!README.md
+
+# ── Misc project artefacts ───────────────────────────────────────────────────
+awesome-claude-code-subagents/
+14
+=0.2.8

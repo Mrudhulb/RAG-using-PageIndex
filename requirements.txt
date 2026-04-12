@@ -20,8 +20,8 @@ rank-bm25>=0.2.2
 pypdf>=4.0.0
 pdfplumber>=0.11.0
 
-# Streamlit UI
-streamlit>=1.38.0
+# LangGraph checkpointing — persists graph state to SQLite (survives restarts)
+langgraph-checkpoint-sqlite>=1.0.0
 
 # FastAPI + Uvicorn (for the API server)
 fastapi>=0.115.0
